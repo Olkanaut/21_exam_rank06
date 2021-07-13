@@ -1,119 +1,127 @@
-#include <stdio.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <netinet/ip.h>
 
-int ids[65536];
-int max_sock = 0;
-int serverFD;
-int idCount = 0;
-fd_set	fds_active, fds_read, fds_write;
-char	buf_read[42*4096], buf_write[42*4096 + 11];
-struct sockaddr_in addr;
+int	count = 0, max_fd = 0;
+int	ids[65536];
+fd_set	read_fd, write_fd, active_fd;
+char	buf_read[4096*42], buf_write[4096*42 + 11];
 
-void	fatal_exit()
+void	error_exit()
 {
 	write(2, "Fatal error\n", 12);
 	exit(1);
 }
 
-void	send_msg(int author)
+void	notify_other(int author)
 {
-	for (int sock = 0; sock <= max_sock; sock++)
+	for (int fd = 0; fd <= max_fd; fd++)
 	{
-		if (FD_ISSET(sock, &fds_write) && sock != author)
-			send(sock, buf_write, strlen(buf_write), 0);
+		if (FD_ISSET(fd, &write_fd) && fd != author)//
+			send(fd, &buf_write, strlen(buf_write), 0);
 	}
 }
 
-int accept_client()
+int		accept_client(int serverFD, struct sockaddr_in *addr)
 {
-	socklen_t addr_len = sizeof(addr);
-	int clientFd = accept(serverFD, (struct sockaddr*)&addr, &addr_len);
-	if (clientFd < 0)
+	socklen_t len = sizeof(addr);
+	int cliendFd = accept(serverFD, (struct sockaddr *)&addr, &len);
+	if (cliendFd < 0)
 		return 1;
 
-	max_sock = (clientFd > max_sock) ? clientFd : max_sock;
-	ids[clientFd] = idCount++;
-	FD_SET(clientFd, &fds_active);
+	max_fd = cliendFd > max_fd ? cliendFd : max_fd;
+	ids[cliendFd] = count++;
 
-	sprintf(buf_write, "server: client %d just arrived\n", ids[clientFd]);
-	send_msg(clientFd);
+	FD_SET(cliendFd, &active_fd);
+	sprintf(buf_write, "server: client %d just arrived\n", ids[cliendFd]);
+	notify_other(cliendFd);
 	return 0;
 }
 
-int main(int ac, char **av)
+int		recieve_msg_and_detach_client(int fd)
 {
-	char  buf_str[42*4096];
+	int read_bytes = recv(fd, &buf_read, 4096*42, 0);
+	if (read_bytes <= 0)
+	{
+		sprintf(buf_write, "server: client %d just left\n", ids[fd]);
+		notify_other(fd);
+		FD_CLR(fd, &active_fd);
+		close(fd);
+	}
+	return read_bytes;
+}
 
+void	send_msg(int fd, int read_bytes)
+{
+	char buf_str[4096*42];
+
+	for (int i = 0, j = 0; i < read_bytes; i++, j++)
+	{
+		buf_str[j] = buf_read[i];//
+		if (buf_str[j] == '\n')
+		{
+			buf_str[j] = '\0';
+			sprintf(buf_write, "client %d: %s\n", ids[fd], buf_str);
+			notify_other(fd);
+			j = -1;
+		}
+	}
+}
+
+int		main(int ac, char **av)
+{
 	if (ac != 2)
 	{
 		write(2, "Wrong number of arguments\n", 26);
 		exit(1);
 	}
-	int port = atoi(av[1]); //(void)port
-
+	int port = atoi(av[1]);
 	bzero(&ids, sizeof(ids));
-	FD_ZERO(&fds_active);
+	FD_ZERO(&active_fd);
 
-	serverFD = socket(AF_INET, SOCK_STREAM, 0);//was local
+	int serverFD = socket(AF_INET, SOCK_STREAM, 0);
 	if (serverFD < 0)
-		fatal_exit();
+		error_exit();
 
-	max_sock = serverFD;
-	FD_SET(serverFD, &fds_active);
+	max_fd = serverFD;
+	FD_SET(serverFD, &active_fd);//
 
-	// struct sockaddr_in addr;//memset(&_sockAddr, 0, sizeof(_sockAddr));
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = (1 << 24) | 127;//htonl(2130706433);
+	addr.sin_addr.s_addr = (1 << 24) | 127;
 	addr.sin_port = htons(port);
-	socklen_t addr_len = sizeof(addr);
 
-	if (bind(serverFD, (const struct sockaddr*)&addr, addr_len))
-		fatal_exit();
-	if (listen(serverFD, SOMAXCONN))//SOMAXCONN or 0//150
-		fatal_exit();
+	if (bind(serverFD, (const struct sockaddr *)&addr, sizeof(addr)))
+		error_exit();
+	if (listen(serverFD, SOMAXCONN))
+		error_exit();
 
 	while (1)
 	{
-		fds_read = fds_write = fds_active;
-		if (select(max_sock + 1, &fds_read, &fds_write, NULL, NULL) < 0)
+		read_fd = write_fd = active_fd;
+		if (select(max_fd + 1, &read_fd, &write_fd, NULL, NULL) < 0)
 			continue ;
 
-		for (int sock = 0; sock <= max_sock; sock++)
+		for (int fd = 0; fd <= max_fd; fd++)
 		{
-			if (FD_ISSET(sock, &fds_read) == 0)
+			if (FD_ISSET(fd, &read_fd) == 0)
 				continue ;
 
-			if (sock == serverFD)
+			if (fd == serverFD)
 			{
-				if (accept_client())
+				if (accept_client(serverFD, &addr))
 					continue ;
 				break ;
 			}
 
-			int read_bytes = recv(sock, buf_read, 42*4096, 0);
+			int read_bytes = recieve_msg_and_detach_client(fd);
 			if (read_bytes <= 0)
-			{
-				sprintf(buf_write, "server: client %d just left\n", ids[sock]);
-				send_msg(sock);
-				FD_CLR(sock, &fds_active);
-				close(sock);//
 				break ;
-			}
-			for (int i = 0, j = 0; i < read_bytes; i++, j++)
-			{
-				buf_str[j] = buf_read[i];
-				if (buf_str[j] == '\n')
-				{
-					buf_str[j] = '\0';
-					sprintf(buf_write, "client %d: %s\n", ids[sock], buf_str);
-					send_msg(sock);
-					j = -1;////
-				}
-			}
+			send_msg(fd, read_bytes);
 		}
 	}
-	return (0);
+	return 0;
 }
